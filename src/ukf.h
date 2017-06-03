@@ -53,8 +53,12 @@ public:
     ///* Radar measurement noise standard deviation angle in rad
     double std_radphi_;
 
+
     ///* Radar measurement noise standard deviation radius change in m/s
     double std_radrd_;
+
+    MatrixXd R_las_;
+    MatrixXd R_radr_;
 
     ///* Weights of sigma points
     VectorXd weights_;

@@ -30,7 +30,7 @@ UKF::UKF() {
     std_yawdd_ = 0.5;
 
     // Laser measurement noise standard deviation position1 in m
-    std_laspx_ = 0.18;
+    std_laspx_ = 0.15;
 
     // Laser measurement noise standard deviation position2 in m
     std_laspy_ = 0.15;
@@ -63,6 +63,14 @@ UKF::UKF() {
 
     Xsig_pred_ = MatrixXd(n_x_, 2 * n_aug_ + 1);
 
+    R_las_ = MatrixXd(2, 2);
+    R_las_ << std_laspx_ * std_laspx_, 0,
+            0, std_laspy_ * std_laspy_;
+
+    R_radr_ = MatrixXd(3, 3);
+    R_radr_ << std_radr_ * std_radr_, 0, 0,
+            0, std_radphi_ * std_radphi_, 0,
+            0, 0, std_radrd_ * std_radrd_;
 }
 
 UKF::~UKF() {}
@@ -76,15 +84,23 @@ void UKF::ProcessMeasurement(MeasurementPackage meas_package) {
         cout << "ukf:" << endl;
         x_ << 1, 1, 0, 0, 0;
 
+        double px, py;
         if (meas_package.sensor_type_ == meas_package.RADAR) {
             double ro = meas_package.raw_measurements_(0);
             double phi = meas_package.raw_measurements_(1);
-            x_(0) = ro * cos(phi);
-            x_(1) = ro * sin(phi);
+            px = ro * cos(phi);
+            py = ro * sin(phi);
         } else if (meas_package.sensor_type_ == meas_package.LASER) {
-            x_(0) = meas_package.raw_measurements_(0);
-            x_(1) = meas_package.raw_measurements_(1);
+            px = meas_package.raw_measurements_(0);
+            py = meas_package.raw_measurements_(1);
         }
+        if (fabs(px) < 0.001 && fabs(py) < 0.001) {
+            px = 0.001;
+            py = 0.001;
+        }
+
+        x_(0) = px;
+        x_(1) = py;
 
         P_ = MatrixXd::Identity(n_x_, n_x_);
 
@@ -97,6 +113,11 @@ void UKF::ProcessMeasurement(MeasurementPackage meas_package) {
     double delta_t = (meas_package.timestamp_ - time_us_) / 1000000.0;
     time_us_ = meas_package.timestamp_;
 
+    while (delta_t > 0.2) {
+        double step = 0.1;
+        Prediction(step);
+        delta_t -= step;
+    }
     Prediction(delta_t);
 
     if (meas_package.sensor_type_ == meas_package.RADAR && use_radar_) {
@@ -199,50 +220,25 @@ void UKF::UpdateLidar(MeasurementPackage meas_package) {
     You'll also need to calculate the lidar NIS.
     */
 
-    int n_z = 2;
-    MatrixXd Zsig = MatrixXd(n_z, 2 * n_aug_ + 1);
+    MatrixXd H = MatrixXd(2, 5);
+    H << 1, 0, 0, 0, 0,
+            0, 1, 0, 0, 0;
 
-    for (int i = 0; i < 2 * n_aug_ + 1; i++) {
-        Zsig(0, i) = Xsig_pred_(0, i);
-        Zsig(1, i) = Xsig_pred_(1, i);
-    }
+    VectorXd z_pred = H * x_;
 
-    VectorXd z_pred = VectorXd(n_z);
-    z_pred.fill(0.0);
-    for (int i = 0; i < 2 * n_aug_ + 1; i++) {
-        z_pred += weights_(i) * Zsig.col(i);
-    }
+    MatrixXd Ht = H.transpose();
+    MatrixXd S = H * P_ * Ht + R_las_;
+    MatrixXd Si = S.inverse();
+    MatrixXd K = P_ * Ht * Si;
 
-    MatrixXd S = MatrixXd(n_z, n_z);
-    S.fill(0.0);
-    for (int i = 0; i < 2 * n_aug_ + 1; i++) {
-        VectorXd z_diff = Zsig.col(i) - z_pred;
-
-        S += weights_(i) * z_diff * z_diff.transpose();
-    }
-
-    MatrixXd R = MatrixXd(n_z, n_z);
-    R << std_laspx_ * std_laspx_, 0,
-            0, std_laspy_ * std_laspy_;
-    S += R;
-
-    MatrixXd Tc = MatrixXd(n_x_, n_z);
-    Tc.fill(0.0);
-    for (int i = 0; i < 2 * n_aug_ + 1; i++) {
-        VectorXd z_diff = Zsig.col(i) - z_pred;
-        VectorXd x_diff = Xsig_pred_.col(i) - x_;
-
-        Tc += weights_(i) * x_diff * z_diff.transpose();
-    }
-
-    MatrixXd K = Tc * S.inverse();
-    VectorXd z = VectorXd(n_z);
+    VectorXd z = VectorXd(2);
     z << meas_package.raw_measurements_(0), meas_package.raw_measurements_(1);
 
     VectorXd z_diff = z - z_pred;
 
     x_ += K * z_diff;
-    P_ -= K * S * K.transpose();
+    MatrixXd I = MatrixXd::Identity(n_x_, n_x_);
+    P_ = (I - K * H) * P_;
 
     nis_laser_ = z_diff.transpose() * S.inverse() * z_diff;
     laser_measurement_count_++;
@@ -251,7 +247,8 @@ void UKF::UpdateLidar(MeasurementPackage meas_package) {
     }
 
     std::cout << printf("laser measurement total: %d, valid: %d, valid percent: %f", laser_measurement_count_,
-                        valid_laser_measurement_count_, valid_laser_measurement_count_ / double(laser_measurement_count_))
+                        valid_laser_measurement_count_,
+                        valid_laser_measurement_count_ / double(laser_measurement_count_))
               << std::endl;
 }
 
@@ -281,6 +278,10 @@ void UKF::UpdateRadar(MeasurementPackage meas_package) {
         double v2 = v * sin(yaw);
 
         Zsig(0, i) = sqrt(px * px + py * py);
+        if (fabs(px) < 0.001 && fabs(py) < 0.001) {
+            px = 0.001;
+            py = 0.001;
+        }
         Zsig(1, i) = atan2(py, px);
         Zsig(2, i) = (px * v1 + py * v2) / sqrt(px * px + py * py);
     }
@@ -297,17 +298,12 @@ void UKF::UpdateRadar(MeasurementPackage meas_package) {
         VectorXd z_diff = Zsig.col(i) - z_pred;
 
         while (z_diff(1) > M_PI) z_diff(1) -= 2. * M_PI;
-        while (z_diff(1) < -M_PI) z_diff(1) -= 2. * M_PI;
+        while (z_diff(1) < -M_PI) z_diff(1) += 2. * M_PI;
 
         S += weights_(i) * z_diff * z_diff.transpose();
     }
 
-    MatrixXd R = MatrixXd(n_z, n_z);
-    R << std_radr_ * std_radr_, 0, 0,
-            0, std_radphi_ * std_radphi_, 0,
-            0, 0, std_radrd_ * std_radrd_;
-
-    S += R;
+    S += R_radr_;
 
     MatrixXd Tc = MatrixXd(n_x_, n_z);
     Tc.fill(0.0);
@@ -341,6 +337,7 @@ void UKF::UpdateRadar(MeasurementPackage meas_package) {
     }
 
     std::cout << printf("radar measurement total: %d, valid: %d, valid percent: %f", radar_measurement_count_,
-                        valid_radar_measurement_count_, valid_radar_measurement_count_ / double(radar_measurement_count_))
+                        valid_radar_measurement_count_,
+                        valid_radar_measurement_count_ / double(radar_measurement_count_))
               << std::endl;
 }
